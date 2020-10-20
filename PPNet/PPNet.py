@@ -11,6 +11,46 @@ from torch_scatter import scatter_add
 import time
 
 
+def gather_neighbour(pc, neighbor_idx):
+    batch_size = pc.shape[0]
+    num_points = pc.shape[1]
+    d = pc.shape[2]
+
+    idx_base = torch.arange(0, batch_size, device='cuda').view(-1, 1, 1)*num_points
+    neighbor_idx = neighbor_idx + idx_base
+    neighbor_idx = neighbor_idx.view(-1)
+
+    pc = pc.contiguous()   # (batch_size, num_points, num_dims)  -> (batch_size*num_points, num_dims) #   batch_size * num_points * k + range(0, batch_size*num_points)
+    feature = pc.view(batch_size*num_points, -1)[neighbor_idx, :]
+    feature = feature.view(batch_size, num_points, -1, d) 
+    return feature.permute(0,3,1,2).unsqueeze(1)
+
+
+def batch_gather_neighbour(pc, neighbor_idx):  
+    # pc: B, G, N, 2*C+3
+    # neighbor_idx: B, G, N, K
+
+    # gather the coordinates or features of neighboring points
+    batch_size = pc.shape[0]
+    groups = pc.shape[1]
+    num_points = pc.shape[2]
+    d = pc.shape[3]
+
+    features = []
+    for g in range(groups):
+        g_pc = pc[:,g,:,:] # B, N, C
+        g_neighbor_idx = neighbor_idx[:,g,:,:] # B, N, K
+        feature = gather_neighbour(g_pc, g_neighbor_idx) # B, 1, C//G, N, K
+        features.append(feature)
+    features = torch.cat(features, dim=1) # B, G, 2*C//G+3, N, K
+    
+    unit = (d-3)//2
+    key = features[:,:,:unit,:,:]
+    value = features[:,:,unit:2*unit,:,:]
+    xyz = features[:,:,-3:,:,:]
+
+    return key, value, xyz
+
 
 def scatter_sparse_attention_centrality(attention, idx):
     # O(N) implementation
@@ -269,32 +309,32 @@ class ResNet(nn.Module):
         # res1
         features = self.conv1(end_points['features'])
 
-        features = self.la1(end_points['xyz'][0], end_points['xyz'][0], end_points['mask'], end_points['mask'], features, end_points['neigh_idx'][0])
-        xyz, mask, features = self.btnk1(end_points['xyz'][0], end_points['mask'], features, end_points['neigh_idx'][0])
+        features = self.la1(end_points['xyz'][0], end_points['xyz'][0], end_points['mask'], end_points['mask'], features)
+        xyz, mask, features = self.btnk1(end_points['xyz'][0], end_points['mask'], features)
         end_points['res1_xyz'] = xyz
         end_points['res1_mask'] = mask
         end_points['res1_features'] = features
 
         # res2
-        xyz, mask, features = self.layer1(xyz, mask, features, end_points['neigh_idx'][1])
+        xyz, mask, features = self.layer1(xyz, mask, features)
         end_points['res2_xyz'] = xyz
         end_points['res2_mask'] = mask
         end_points['res2_features'] = features
 
         # res3
-        xyz, mask, features = self.layer2(xyz, mask, features, end_points['neigh_idx'][2])
+        xyz, mask, features = self.layer2(xyz, mask, features)
         end_points['res3_xyz'] = xyz
         end_points['res3_mask'] = mask
         end_points['res3_features'] = features
 
         # res4
-        xyz, mask, features = self.layer3(xyz, mask, features, end_points['neigh_idx'][3])
+        xyz, mask, features = self.layer3(xyz, mask, features)
         end_points['res4_xyz'] = xyz
         end_points['res4_mask'] = mask
         end_points['res4_features'] = features
 
         # res5
-        xyz, mask, features = self.layer4(xyz, mask, features, end_points['neigh_idx'][4])
+        xyz, mask, features = self.layer4(xyz, mask, features)
         end_points['res5_xyz'] = xyz
         end_points['res5_mask'] = mask
         end_points['res5_features'] = features
@@ -393,7 +433,7 @@ class GTResNet(nn.Module):
 
 
         # res1
-        #print("Res1")
+        print("Res1")
 
         features_queryandkey = self.conv1_queryandkey(end_points['features'])
         features_value = self.conv1_value(end_points['features'])
@@ -402,17 +442,16 @@ class GTResNet(nn.Module):
         end_points['res1_xyz'] = xyz
         end_points['res1_mask'] = mask
         end_points['res1_features'] = features
-
          
         # res2
-        #print("Res2")
+        print("Res2")
         xyz, mask, features, attention_centrality, _ = self.layer1(xyz, mask, features, None, end_points['neigh_idx'][1])
         end_points['res2_xyz'] = xyz
         end_points['res2_mask'] = mask
         end_points['res2_features'] = features
 
         # res3
-        #print("Res3")
+        print("Res3")
         xyz, mask, features, attention_centrality, _ = self.layer2(xyz, mask, features, None, end_points['neigh_idx'][2])
         end_points['res3_xyz'] = xyz
         end_points['res3_mask'] = mask
@@ -420,7 +459,7 @@ class GTResNet(nn.Module):
 
 
         # res4
-        #print("Res4")
+        print("Res4")
         xyz, mask, features, attention_centrality, _ = self.layer3(xyz, mask, features, None, end_points['neigh_idx'][3])
         end_points['res4_xyz'] = xyz
         end_points['res4_mask'] = mask
@@ -428,7 +467,7 @@ class GTResNet(nn.Module):
 
 
         # res5
-        #print("Res5")
+        print("Res5")
         xyz, mask, features, attention_centrality, _ = self.layer4(xyz, mask, features, None, end_points['neigh_idx'][4])
         end_points['res5_xyz'] = xyz
         end_points['res5_mask'] = mask
@@ -586,7 +625,7 @@ class GTLModuleV1(nn.Module):
         super(GTLModuleV1, self).__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
-        #self.radius = radius. No Need for GTModule
+        self.radius = radius#. No Need for GTModule
         self.nsample = nsample
         self.position_embedding = config.position_embedding
         self.reduction = config.reduction
@@ -618,149 +657,65 @@ class GTLModuleV1(nn.Module):
            output features of query points: [B, C_out, 3]
         """ 
 
-        # 1. Acquire Local Neighborhood index and relative position
-        #idx, idx_mask = masked_ordered_ball_query(self.radius, self.nsample, query_xyz, support_xyz,
-                                                  #query_mask, support_mask)
-
         # GT Module Properties
-        # 1. query = support 
         QueryandKey, Value, AC = queryandkey, value, attention_centrality # B, C, Nc / B, C, Nc / B, G, Nc
         B = QueryandKey.shape[0]
         C = QueryandKey.shape[1]
         npoints = QueryandKey.shape[2]
         nsample = self.nsample
-        groups = 9
+        groups = 4
         Cnl = 0
         Cl = C - Cnl
 
+
+        #print("Cnl : {}".format(Cnl))
+        #print("Cl : {}".format(Cl))
       
-        # 0. Acquire Attention Centrality Index
+        # 0. Acquire Common features
         idx_knn = idx_knn.unsqueeze(1).repeat(1,groups,1,1) # B, G, Nc, K
+        xyz_trans = support_xyz.unsqueeze(1).repeat(1,groups,1,1).contiguous() # B,G,Nc,3
 
         # 1. Local and Non-local Query 
         LocalQuery = QueryandKey[:,:Cl,:].contiguous().view(B, groups, Cl//groups, npoints) # B, G, C//G, Nc
 
-        # 2. Key
+        # 2. Local ops
         LocalKey = QueryandKey[:,:Cl,:].contiguous().view(B, groups, Cl//groups, npoints) # B, G, C//G, Nc
-                
-        LocalKey = self.batch_gather_neighbour(LocalKey.permute(0,1,3,2), idx_knn) # B, G, Nc, C//G and B, G, Nc, K -> B, G, C//G, Nc, K
-
-
-        # 3. Relative Pos for Value
-        #xyz_trans = support_xyz.transpose(1, 2).unsqueeze(1).repeat(1,groups,1,1).contiguous() # B,G,Nc,3
-        #Lxyz = self.batch_gather_neighbour(xyz_trans.permute(0,1,3,2), idx_knn) # B,G,Nc,3 and B,G,Nc,K -> B,G,3,Nc,K
-        #Lxyz -= query_xyz.transpose(1, 2).unsqueeze(1).unsqueeze(-1) # B,1,Nc,C,1
-
-        # 4. Value
         LocalValue = Value[:,:Cl,:].contiguous().view(B, groups, Cl//groups, npoints)
-        LocalValue = self.batch_gather_neighbour(LocalValue.permute(0,1,3,2), idx_knn) # B, G, Nc, C//G and B, G, Nc, K -> B, G, C//G, Nc, K
 
-        if self.use_xyz:
-            LocalValue = torch.cat([LocalValue, Lxyz], dim=2) 
 
-        # 5. Attention Centrality
+        LocalKVXyz = torch.cat([LocalKey.permute(0,1,3,2), LocalValue.permute(0,1,3,2), xyz_trans], dim=3) 
+        LocalKey, LocalValue, LocalXyz = batch_gather_neighbour(LocalKVXyz, idx_knn)
+        LocalXyz -= query_xyz.transpose(1, 2).unsqueeze(1).unsqueeze(-1)       
+
+        # 3. Attention Centrality
         LocalAtt = (LocalQuery.unsqueeze(-1) * LocalKey).sum(2) # B, G, N, K
         LocalAtt = F.softmax(LocalAtt, dim=-1) # B, G, N, K
 
         current_AC = scatter_sparse_attention_centrality(LocalAtt, idx_knn[:,0,:,:]) # B, G, N
         
-        
-        # 6. Positional Encoding
-        '''
+        # 4. Positional Encoding
         if self.position_embedding == 'xyz':
-            position_embedding = torch.unsqueeze(relative_position, 1)
-            aggregation_features = neighborhood_features.view(B, C // 3, 3, npoint, self.nsample)
-            aggregation_features = position_embedding * aggregation_features  # (B, C//3, 3, npoint, nsample)
-            aggregation_features = aggregation_features.view(B, C, npoint, self.nsample)  # (B, C, npoint, nsample)
-        elif self.position_embedding == 'sin_cos':
-            feat_dim = C // 6
-            wave_length = 1000
-            alpha = 100
-            feat_range = torch.arange(feat_dim, dtype=torch.float32).to(query_xyz.device)  # (feat_dim, )
-            dim_mat = torch.pow(1.0 * wave_length, (1.0 / feat_dim) * feat_range)  # (feat_dim, )
-            position_mat = torch.unsqueeze(alpha * relative_position, -1)  # (B, 3, npoint, nsample, 1)
-            div_mat = torch.div(position_mat, dim_mat)  # (B, 3, npoint, nsample, feat_dim)
-            sin_mat = torch.sin(div_mat)  # (B, 3, npoint, nsample, feat_dim)
-            cos_mat = torch.cos(div_mat)  # (B, 3, npoint, nsample, feat_dim)
-            position_embedding = torch.cat([sin_mat, cos_mat], -1)  # (B, 3, npoint, nsample, 2*feat_dim)
-            position_embedding = position_embedding.permute(0, 1, 4, 2, 3).contiguous()
-            position_embedding = position_embedding.view(B, C, npoint, self.nsample)  # (B, C, npoint, nsample)
-            aggregation_features = neighborhood_features * position_embedding  # (B, C, npoint, nsample)
-        else:
-            pass
-        '''
+            local_position_embedding = torch.unsqueeze(LocalXyz, 2)
 
-        # 7. Sum
+
+            LocalValue = LocalValue.view(B, groups, Cl // (3*groups), 3, npoints, self.nsample) # B, G, C//3, 3, N, K
+
+
+            LocalValue = local_position_embedding * LocalValue  # (B, G, C//3, 3, npoint, nsample)
+            LocalValue = LocalValue.view(B, groups, Cl // groups, npoints, self.nsample)  # (B, C, npoint, nsample)
+
+        #print(LocalValue[0,0,:,0,:].shape)
+        #print(LocalValue[0,0,:,0,:])
+        #print(LocalValue.mean(0).mean(0).mean(1).mean(1).shape)
+        #print(LocalValue.mean(0).mean(0).mean(1).mean(1))
+
+        # 5. Sum
         LocalFeature = (LocalAtt.unsqueeze(2) * LocalValue).sum(-1) # B, G, Cl//G+3, N 
         LocalFeature = LocalFeature.view(B, -1, npoints) # B, Cl+3G, N
-
-        #if self.output_conv:
-        #    out_features = self.out_conv(out_features)
-        #else:
-
-        #Features = self.out_transform(LocalFeatures)
 
         return LocalFeature, current_AC
     
     
-    def gather_neighbour(self, pc, neighbor_idx):  # pc: batch*npoint*channel
-        # gather the coordinates or features of neighboring points
-        batch_size = pc.shape[0]
-        num_points = pc.shape[1]
-        d = pc.shape[2]
-        index_input = neighbor_idx.reshape(batch_size, -1) # b, nk
-
-        #TODO THIS LINE IS REQUIRED TO BE OPTIMIZED
-        features = torch.gather(pc, 1, index_input.unsqueeze(-1).repeat(1, 1, pc.shape[2])) # b,n,c -> b,nk,c
-        
-        features = features.reshape(batch_size, num_points, neighbor_idx.shape[-1], d)  # batch*npoint*nsamples*channel
-        return features.permute(0,3,1,2).unsqueeze(1) # B,1,C//G,N,K
-
-
-    def gather_neighbourv2(self, pc, neighbor_idx):
-        batch_size = pc.shape[0]
-        num_points = pc.shape[1]
-        d = pc.shape[2]
-
-        idx_base = torch.arange(0, batch_size, device='cuda').view(-1, 1, 1)*num_points
-        neighbor_idx = neighbor_idx + idx_base
-        neighbor_idx = neighbor_idx.view(-1)
-
-        pc = pc.contiguous()   # (batch_size, num_points, num_dims)  -> (batch_size*num_points, num_dims) #   batch_size * num_points * k + range(0, batch_size*num_points)
-        feature = pc.view(batch_size*num_points, -1)[neighbor_idx, :]
-        feature = feature.view(batch_size, num_points, -1, d) 
-        return feature.permute(0,3,1,2).unsqueeze(1)
-
-
-    def batch_gather_neighbour(self, pc, neighbor_idx):  
-        # pc: B, G, N, C
-        # neighbor_idx: B, G, N, K
-
-        # gather the coordinates or features of neighboring points
-        batch_size = pc.shape[0]
-        groups = pc.shape[1]
-        num_points = pc.shape[2]
-        d = pc.shape[3]
-
-        features = []
-        for g in range(groups):
-            g_pc = pc[:,g,:,:] # B, N, C
-            g_neighbor_idx = neighbor_idx[:,g,:,:] # B, N, K
-            feature = self.gather_neighbourv2(g_pc, g_neighbor_idx) # B, 1, C//G, N, K
-            features.append(feature)
-
-        features = torch.cat(features, dim=1)
-
-        return features
-
-        # matrix implementation
-        '''
-        pc = pc.reshape(batch_size*groups, num_points, d) # bg, n, c
-        index_input = neighbor_idx.reshape(batch_size*groups, -1) # bg, nk
-        features = torch.gather(pc, 1, index_input.unsqueeze(-1).repeat(1, 1, pc.shape[2])) # bg,n,c -> bg,nk,c
-        features = features.reshape(batch_size, groups, num_points, neighbor_idx.shape[-1], d)  # batch*groups*npoint*nsamples*channel
-        return features.permute(0,1,4,2,3) # b,g,c//g,n,k
-        '''
 
 
 
@@ -778,7 +733,7 @@ class GTModuleV1(nn.Module):
         super(GTModuleV1, self).__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
-        #self.radius = radius. No Need for GTModule
+        self.radius = radius#. No Need for GTModule
         self.nsample = nsample
         self.position_embedding = config.position_embedding
         self.reduction = config.reduction
@@ -811,58 +766,55 @@ class GTModuleV1(nn.Module):
            output features of query points: [B, C_out, 3]
         """ 
 
-        # 1. Acquire Local Neighborhood index and relative position
-        #idx, idx_mask = masked_ordered_ball_query(self.radius, self.nsample, query_xyz, support_xyz,
-                                                  #query_mask, support_mask)
-
-
         # GT Module Properties
-        # 1. query = support 
         QueryandKey, Value, AC = queryandkey, value, attention_centrality # B, C, Nc / B, C, Nc / B, G, Nc
+        print(AC[0,0,:])
+
         B = QueryandKey.shape[0]
         C = QueryandKey.shape[1]
         npoints = QueryandKey.shape[2]
         nsample = self.nsample
-        groups = 9
+        groups = 4
 
         Cnl = C//4
         Cl = C - Cnl
 
-        # 0. Acquire Attention Centrality Index
+        #print("Cnl : {}".format(Cnl))
+        #print("Cl : {}".format(Cl))
+
+        # 0. Acquire Common features
         _, idx_ac = AC.topk(k=nsample, dim=2) # B, G, Nc -> B, G, K
         idx_ac = idx_ac.unsqueeze(2).repeat(1,1,npoints,1) # B, G, Nc, K
         idx_knn = idx_knn.unsqueeze(1).repeat(1,groups,1,1) # B, G, Nc, K
+        xyz_trans = support_xyz.unsqueeze(1).repeat(1,groups,1,1).contiguous() # B,G,Nc,3
 
 
         # 1. Local and Non-local Query 
-        #print(QueryandKey[:,:Cl,:].shape)
         LocalQuery = QueryandKey[:,:Cl,:].contiguous().view(B, groups, Cl//groups, npoints) # B, G, C//G, Nc
         NonLocalQuery = QueryandKey[:,Cl:,:].contiguous().view(B, groups, Cnl//groups, npoints)
 
-        # 2. Key
+        # 2. Local ops
         LocalKey = QueryandKey[:,:Cl,:].contiguous().view(B, groups, Cl//groups, npoints) # B, G, C//G, Nc
+
+        LocalValue = Value[:,:Cl,:].contiguous().view(B, groups, Cl//groups, npoints)
+
+
+        # Alternative
+        LocalKVXyz = torch.cat([LocalKey.permute(0,1,3,2), LocalValue.permute(0,1,3,2), xyz_trans], dim=3) 
+        LocalKey, LocalValue, LocalXyz = batch_gather_neighbour(LocalKVXyz, idx_knn)
+        LocalXyz -= query_xyz.transpose(1, 2).unsqueeze(1).unsqueeze(-1)  
+
+
+        # 3. Non-local ops
         NonLocalKey = QueryandKey[:,Cl:,:].contiguous().view(B, groups, Cnl//groups, npoints) # B, G, C//G, Nc
 
-
-        LocalKey = self.batch_gather_neighbour(LocalKey.permute(0,1,3,2), idx_knn) # B, G, Nc, C//G and B, G, Nc, K -> B, G, C//G, Nc, K
-        NonLocalKey = self.batch_gather_neighbour(NonLocalKey.permute(0,1,3,2), idx_ac)
-
-        # 3. Relative Pos for Value
-        xyz_trans = support_xyz.transpose(1, 2).unsqueeze(1).repeat(1,groups,1,1).contiguous() # B,G,Nc,3
-        #Lxyz = self.batch_gather_neighbour(xyz_trans.permute(0,1,3,2), idx_knn) # B,G,Nc,3 and B,G,Nc,K -> B,G,3,Nc,K
-        #Lxyz -= query_xyz.transpose(1, 2).unsqueeze(1).unsqueeze(-1) # B,1,Nc,C,1
-        #NLxyz = self.batch_gather_neighbour(xyz_trans.permute(0,1,3,2), idx_ac) # B,G,Nc,3 and B,G,Nc,K -> B,G,3,Nc,K
-        #NLxyz -= query_xyz.transpose(1, 2).unsqueeze(1).unsqueeze(-1) # B,1,Nc,C,1
-
-        # 4. Value
-        LocalValue = Value[:,:Cl,:].contiguous().view(B, groups, Cl//groups, npoints)
         NonLocalValue = Value[:,Cl:,:].contiguous().view(B, groups, Cnl//groups, npoints)
-        LocalValue = self.batch_gather_neighbour(LocalValue.permute(0,1,3,2), idx_knn) # B, G, Nc, C//G and B, G, Nc, K -> B, G, C//G, Nc, K
-        NonLocalValue = self.batch_gather_neighbour(NonLocalValue.permute(0,1,3,2), idx_ac)
 
-        if self.use_xyz:
-            LocalValue = torch.cat([LocalValue, Lxyz], dim=2) 
-            NonLocalValue = torch.cat([NonLocalValue, NLxyz], dim=2)
+        NonLocalKVXyz = torch.cat([NonLocalKey.permute(0,1,3,2), NonLocalValue.permute(0,1,3,2), xyz_trans], dim=3)
+        NonLocalKey, NonLocalValue, NonLocalXyz = batch_gather_neighbour(NonLocalKVXyz, idx_ac)
+
+        NonLocalXyz -= query_xyz.transpose(1, 2).unsqueeze(1).unsqueeze(-1)
+
 
         # 5. Attention Centrality
         LocalAtt = (LocalQuery.unsqueeze(-1) * LocalKey).sum(2) # B, G, N, K
@@ -872,47 +824,33 @@ class GTModuleV1(nn.Module):
         NonLocalAtt = F.softmax(NonLocalAtt, dim=-1) # B, G, N, K
 
         current_AC = scatter_sparse_attention_centrality(LocalAtt, idx_knn[:,0,:,:]) # B, G, N
-
         
         # 6. Positional Encoding
-        '''
         if self.position_embedding == 'xyz':
-            position_embedding = torch.unsqueeze(relative_position, 1)
-            aggregation_features = neighborhood_features.view(B, C // 3, 3, npoint, self.nsample)
-            aggregation_features = position_embedding * aggregation_features  # (B, C//3, 3, npoint, nsample)
-            aggregation_features = aggregation_features.view(B, C, npoint, self.nsample)  # (B, C, npoint, nsample)
-        elif self.position_embedding == 'sin_cos':
-            feat_dim = C // 6
-            wave_length = 1000
-            alpha = 100
-            feat_range = torch.arange(feat_dim, dtype=torch.float32).to(query_xyz.device)  # (feat_dim, )
-            dim_mat = torch.pow(1.0 * wave_length, (1.0 / feat_dim) * feat_range)  # (feat_dim, )
-            position_mat = torch.unsqueeze(alpha * relative_position, -1)  # (B, 3, npoint, nsample, 1)
-            div_mat = torch.div(position_mat, dim_mat)  # (B, 3, npoint, nsample, feat_dim)
-            sin_mat = torch.sin(div_mat)  # (B, 3, npoint, nsample, feat_dim)
-            cos_mat = torch.cos(div_mat)  # (B, 3, npoint, nsample, feat_dim)
-            position_embedding = torch.cat([sin_mat, cos_mat], -1)  # (B, 3, npoint, nsample, 2*feat_dim)
-            position_embedding = position_embedding.permute(0, 1, 4, 2, 3).contiguous()
-            position_embedding = position_embedding.view(B, C, npoint, self.nsample)  # (B, C, npoint, nsample)
-            aggregation_features = neighborhood_features * position_embedding  # (B, C, npoint, nsample)
+            local_position_embedding = torch.unsqueeze(LocalXyz, 2)
+            nonlocal_position_embedding = torch.unsqueeze(NonLocalXyz, 2) # B, G, 1, 3, N, K
+           
+            LocalValue = LocalValue.view(B, groups, Cl // (3*groups), 3, npoints, self.nsample) # B, G, C//3, 3, N, K
+            LocalValue = local_position_embedding * LocalValue  # (B, G, C//3, 3, npoint, nsample)
+            LocalValue = LocalValue.view(B, groups, Cl // groups, npoints, self.nsample)  # (B, C, npoint, nsample)
+
+            NonLocalValue = NonLocalValue.view(B, groups, Cnl // (3*groups), 3, npoints, self.nsample)
+            NonLocalValue = nonlocal_position_embedding * NonLocalValue  # (B, G, C//3, 3, npoint, nsample)
+            NonLocalValue = NonLocalValue.view(B, groups, Cnl // groups, npoints, self.nsample)  # (B, C, npoint, nsample)
+            
         else:
             pass
-        '''
 
         # 7. Sum
-        LocalFeature = (LocalAtt.unsqueeze(2) * LocalValue).sum(-1) # B, G, Cl//G+3, N 
-        NonLocalFeature = (NonLocalAtt.unsqueeze(2) * NonLocalValue).sum(-1) # B, G, Cnl//G+3, N
+        LocalFeature = (LocalAtt.unsqueeze(2) * LocalValue).sum(-1) # B, G, Cl//G, N 
+        NonLocalFeature = (NonLocalAtt.unsqueeze(2) * NonLocalValue).sum(-1) # B, G, Cnl//G, N
 
         LocalFeature = LocalFeature.view(B, -1, npoints)
         NonLocalFeature = NonLocalFeature.view(B, -1, npoints)
         
         Features = torch.cat([LocalFeature, NonLocalFeature], dim=1)
 
-        #if self.output_conv:
-        #    out_features = self.out_conv(out_features)
-        #else:
-
-        #Features = self.out_transform(Features)
+        
 
         return Features, current_AC
 
@@ -927,19 +865,6 @@ class GTModuleV1(nn.Module):
         features = features.reshape(batch_size, num_points, neighbor_idx.shape[-1], d)  # batch*npoint*nsamples*channel
         return features.permute(0,3,1,2).unsqueeze(1)
 
-    def gather_neighbourv2(self, pc, neighbor_idx):
-        batch_size = pc.shape[0]
-        num_points = pc.shape[1]
-        d = pc.shape[2]
-
-        idx_base = torch.arange(0, batch_size, device='cuda').view(-1, 1, 1)*num_points
-        neighbor_idx = neighbor_idx + idx_base
-        neighbor_idx = neighbor_idx.view(-1)
-
-        pc = pc.contiguous()   # (batch_size, num_points, num_dims)  -> (batch_size*num_points, num_dims) #   batch_size * num_points * k + range(0, batch_size*num_points)
-        feature = pc.view(batch_size*num_points, -1)[neighbor_idx, :]
-        feature = feature.view(batch_size, num_points, -1, d) 
-        return feature.permute(0,3,1,2).unsqueeze(1)
 
     def batch_gather_neighbour(self, pc, neighbor_idx):  
         # pc: B, G, N, C
@@ -955,93 +880,11 @@ class GTModuleV1(nn.Module):
         for g in range(groups):
             g_pc = pc[:,g,:,:] # B, N, C
             g_neighbor_idx = neighbor_idx[:,g,:,:] # B, N, K
-            feature = self.gather_neighbourv2(g_pc, g_neighbor_idx) # B, 1, C//G, N, K
+            feature = gather_neighbour(g_pc, g_neighbor_idx) # B, 1, C//G, N, K
             features.append(feature)
         features = torch.cat(features, dim=1)
 
         return features
-
-        # matrix implementation
-        '''
-        pc = pc.reshape(batch_size*groups, num_points, d) # bg, n, c
-        index_input = neighbor_idx.reshape(batch_size*groups, -1) # bg, nk
-        features = torch.gather(pc, 1, index_input.unsqueeze(-1).repeat(1, 1, pc.shape[2])) # bg,n,c -> bg,nk,c
-        features = features.reshape(batch_size, groups, num_points, neighbor_idx.shape[-1], d)  # batch*groups*npoint*nsamples*channel
-        return features.permute(0,1,4,2,3) # b,g,c//g,n,k
-        '''
-
-
-
-
-class GTMaskedQueryAndGroup(nn.Module):
-    def __init__(self, radius, nsample, use_xyz=True, ret_grouped_xyz=False, normalize_xyz=False, config=None):
-        super(MaskedQueryAndGroup, self).__init__()
-        self.radius, self.nsample, self.use_xyz = radius, nsample, use_xyz
-        self.ret_grouped_xyz = ret_grouped_xyz
-        self.normalize_xyz = normalize_xyz
-
-    def forward(self, query_xyz, support_xyz, query_mask, support_mask, queryandkey, value, attention_centrality):
-
-        dim_value = value.shape[1]//4
-        localvalue = value[:,dim_value:,:]
-        nonlocalvalue = value[:,:dim_value,:] # B, Cnl, N
-
-        batch = query_xyz[0]
-        groups = 9
-        npoint = query_xyz[2]
-        dim_localvalue = value.shape[1]//4
-        dim_nonlocalvalue = value.shape[1] - dim_localvalue
-        nsample = 16
-
-        # 1. Acquire Local Neighborhood index and relative position
-        idx, idx_mask = masked_ordered_ball_query(self.radius, self.nsample, query_xyz, support_xyz,
-                                                  query_mask, support_mask)
-
-        xyz_trans = support_xyz.transpose(1, 2).contiguous()
-
-        grouped_localxyz = grouping_operation(xyz_trans, idx)  # b,3,np and b,nc,k -> b,3,nc,k
-
-        grouped_localxyz -= query_xyz.transpose(1, 2).unsqueeze(-1)
-
-        if self.normalize_xyz:
-            grouped_localxyz /= self.radius
-
-        grouped_localvalue = grouping_operation(torch.cat([localvalue, queryandkey], dim=1), idx) # b,(f+1),np and b,nc,k -> b,f+1,nc,k
-        #attention_centrality = grouped_localvalue[:,-groups:,:,0] # B, G, Nc
-        grouped_localvalue = grouped_localvalue[:,:dim_localvalue,:,:] # B, Cl, Nc, K
-        queryandkey = grouped_localvalue[:,dim_localvalue:-groups,:,0] # B, C, Nc
-
-        grouped_localxyz = grouped_localxyz.view(batch, groups, 3, npoint, nsample)
-        grouped_localvalue = grouped_localvalue.view(batch, groups, dim_localvalue, npoint, nsample) 
-
-        #TODO must check, the first one is itself. 
-        if self.use_xyz:
-            new_localfeatures = torch.cat([grouped_localxyz, grouped_localvalue], dim=2)  # (B, G, C + 3, npoint, nsample)
-        else:
-            new_localfeatures = grouped_localvalue
-
-
-        # 2. Acquire Non-local Neighborhood index and relative position
-        _, idx_ac = attention_centrality.topk(k=nsample, dim=2) # B, G, Np -> B, G, K
-        idx_ac = idx_ac.unsqueeze(2).repeat(1,1,npoint,1) # B, G, Nc, K
-
-        new_nonlocalfeatures = []
-        nonlocalvalue = nonlocalvalue.view(batch, groups, dim_nonlocalvalue, npoint) # B, G, C//G, N
-        for j in range(8):
-            grouped_nonlocalxyz = grouping_operation(xyz_trans, idx_ac[:,j,:,:])
-            grouped_nonlocalxyz -= query_xyz.transpose(1, 2).unsqueeze(-1)
-            grouped_nonlocalvalue = grouping_operation(nonlocalvalue[:,j,:,:], idx_ac[:,j,:,:])
-            new_nonlocalfeature = torch.cat([grouped_nonlocalxyz, grouped_nonlocalvalue], dim=1).unsqueeze(1) # B, 1, C+3, N, K
-            new_nonlocalfeatures.append(new_nonlocalfeature)
-        new_nonlocalfeatures = torch.cat(new_nonlocalfeatures, dim=1) # B, G, C//G+3, N, K
-            
-
-        if self.ret_grouped_xyz:
-            return new_localfeatures, grouped_localxyz, new_nonlocalfeatures, grouped_nonlocalxyz, idx_mask, queryandkey
-        else:
-            return new_localfeatures, new_nonlocalfeatures, idx_mask, queryandkey
-
-
 
 
 
@@ -1146,9 +989,9 @@ class PosPool(nn.Module):
         self.out_channels = out_channels
         self.radius = radius
         self.nsample = nsample
-        self.position_embedding = config.pospool.position_embedding
-        self.reduction = config.pospool.reduction
-        self.output_conv = config.pospool.output_conv or (self.in_channels != self.out_channels)
+        self.position_embedding = config.position_embedding
+        self.reduction = config.reduction
+        self.output_conv = config.output_conv or (self.in_channels != self.out_channels)
 
         self.grouper = MaskedQueryAndGroup(radius, nsample, use_xyz=False, ret_grouped_xyz=True, normalize_xyz=True)
         if self.output_conv:
@@ -1181,6 +1024,8 @@ class PosPool(nn.Module):
 
         if self.position_embedding == 'xyz':
             position_embedding = torch.unsqueeze(relative_position, 1)
+            print("Pospool")
+            print(position_embedding[0,0,:,0,:])
             aggregation_features = neighborhood_features.view(B, C // 3, 3, npoint, self.nsample)
             aggregation_features = position_embedding * aggregation_features  # (B, C//3, 3, npoint, nsample)
             aggregation_features = aggregation_features.view(B, C, npoint, self.nsample)  # (B, C, npoint, nsample)
