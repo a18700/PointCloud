@@ -1,0 +1,38 @@
+input_features_dim: 6
+
+# ---------------------------------------------------------------------------- #
+# Model
+# ---------------------------------------------------------------------------- #
+backbone: 'resnet'
+head: 'resnet_scene_seg'
+radius: 0.1
+sampleDl: 0.04
+
+# nsamples and npoints to be revised for adopting RandLANet setting.
+nsamples:
+  - 16
+  - 16
+  - 16
+  - 16
+  - 16
+npoints:
+  - 10240
+  - 2560
+  - 640
+  - 160
+
+width: 144
+depth: 2
+bottleneck_ratio: 2
+
+in_radius: 2.0
+num_steps: 2000
+
+# ---------------------------------------------------------------------------- #
+# Local Aggregation options
+# ---------------------------------------------------------------------------- #
+local_aggregation_type: 'gt'
+pospool:
+  position_embedding: 'xyz'
+  reduction: 'avg'
+  output_conv: False
