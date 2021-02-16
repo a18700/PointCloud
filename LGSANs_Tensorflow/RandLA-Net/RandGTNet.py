@@ -181,6 +181,14 @@ class Network:
                 #op1 = self.inputs['neigh_idx']
                 #op2 = self.inputs['xyz']
                 #op3 = self.inputs['sub_idx']
+                #nei1 = self.sess.run(op1)
+                #nei2 = self.sess.run(op2)
+                #nei3 = self.sess.run(op3)
+                #for i in range(self.config.num_layers):
+                #    print("neighidxs {}".format(nei1[i].shape))
+                #    print("sub_idxs {}".format(nei3[i].shape))
+                #    #print("xyzs {}".format(nei2[i].shape))
+                #print("==========================================================")
                 ops = [self.train_op,
                        self.extra_update_ops,
                        self.merged,
@@ -188,16 +196,6 @@ class Network:
                        self.logits,
                        self.labels,
                        self.accuracy]
-                #nei1 = self.sess.run(op1)
-                #nei2 = self.sess.run(op2)
-                #nei3 = self.sess.run(op3)
-                
-                #for i in range(self.config.num_layers):
-                #    print("neighidxs {}".format(nei1[i].shape))
-                #    print("sub_idxs {}".format(nei3[i].shape))
-                #    #print("xyzs {}".format(nei2[i].shape))
-                
-                #print("==========================================================")
                 
                 _, _, summary, l_out, probs, labels, acc = self.sess.run(ops, {self.is_training: True})
                 self.train_writer.add_summary(summary, self.training_step)
@@ -310,9 +308,6 @@ class Network:
         return output_loss
 
 
-
-
-
     def dilated_res_block(self, feature, xyz, neigh_idx, d_out, name, is_training):
         # feature : pyt = b, c, n, 1 & tf = b, n, 1, c
         f_pc = helper_tf_util.conv2d(feature, d_out // 2, [1, 1], name + 'mlp1', [1, 1], 'VALID', True, is_training)
@@ -328,11 +323,11 @@ class Network:
         # xyz : pyt = b, n, 3  & tf = b, n, 3 
         # feature : pyt = b, c, n, 1 & tf = b, n, 1, c
         # neigh_idx : pyt = b, n, k & tf = b, n, k
+        
         f_pc = helper_tf_util.conv2d(feature, d_out // 2, [1, 1], name + 'mlp1', [1, 1], 'VALID', True, is_training)
         stored_f_pc, f_pc = self.gtmodule(xyz, f_pc, neigh_idx, d_out, name + 'LFA', is_training, depth)
         f_pc = helper_tf_util.conv2d(f_pc, d_out * 2, [1, 1], name + 'mlp2', [1, 1], 'VALID', True, is_training, activation_fn=None)
         stored_f_pc = helper_tf_util.conv2d(stored_f_pc, d_out * 2, [1, 1], name + 'mlp2_for_store', [1, 1], 'VALID', True, is_training, activation_fn=None)
-        #stored_value = helper_tf_util.conv2d(localvalue, d_out, [1, 1], name + 'conv_for_store', [1, 1], 'VALID', True, is_training)
 
         shortcut = helper_tf_util.conv2d(feature, d_out * 2, [1, 1], name + 'shortcut', [1, 1], 'VALID', activation_fn=None, bn=True, is_training=is_training)
           
@@ -360,6 +355,7 @@ class Network:
         # xyz : pyt = b, n, 3  & tf = b, n, 3 
         # feature : pyt = b, c, n, 1 & tf = b, n, 1, c
         # neigh_idx : pyt = b, n, k & tf = b, n, k
+        
         _,_,_,d_in = feature.get_shape()
         ld_out = int(d_out * 0.75)
         nld_out = int(d_out * 0.25)
@@ -382,7 +378,8 @@ class Network:
         localvalue = tf.transpose(localvalue, perm=(0,2,3,1,4)) # b,n,k,g,c//g
         f_xyz = tf.transpose(f_xyz, perm=(0,2,3,1,4)) # b,n,k,g,10
         f_xyz = tf.reshape(f_xyz, [self.b, n, self.k, -1]) # b,n,k,g*10
-        
+
+        # Because Tensorflow1 does not provide grouped convolution, we employ manual implementation of ShuffleNet.
         f_xyz = helper_tf_util.grouped_conv2d(name + 'local_pe', 
                                      x=f_xyz, 
                                      w=None, 
@@ -400,9 +397,9 @@ class Network:
         f_xyz = tf.reshape(f_xyz, [self.b, n, self.k, self.g, ld_out//self.g]) #b,n,k,g,d_out//2*g
         
         localvalue = tf.concat([localvalue, f_xyz], axis=-1) # b,n,k,g,c//g+d_out//2*g 
+        
+        # counterparts to att_pooling in original RandLANet
         localvalue, attention_centrality = self.gt_pooling(localvalue, ld_out, name + 'gt_pooling_1', is_training, neigh_idx, depth) 
-      
-        #print("localvalue", localvalue.shape)
 
 
         # Stage2 : Global Layer
@@ -410,16 +407,11 @@ class Network:
         # Global Indexing
         _, ac_idx = tf.math.top_k(attention_centrality, k=self.knl) # sorted? # bgk
         ac_idx = tf.tile(tf.expand_dims(ac_idx, axis=2), [1,1,n,1]) # bgk -> bgnk
-
-        #localvalue = tf.transpose(localvalue, [0,2,1,3]) #bngd -> bgnd
         
         # Pointwisely concat feature and coordinates
         globalvalue = tf.concat([tf.transpose(localvalue, [0,2,1,3]), xyz], axis=-1) # b,g,n,c//g+3  
 
         # First local operation
-        #print("globalvalue", globalvalue.shape)
-        #print("ldout", ld_out//self.g)
-        #print("acidx", ac_idx.shape)
 
         globalvalue, g_xyz = self.group_gather_neighbour(globalvalue, ac_idx, None, ld_out//self.g) # b,g,n,k,c//g & b,g,n,k,3
         g_xyz = self.relative_pos_encoding(xyz, g_xyz) # b,g,n,k,d
@@ -427,6 +419,7 @@ class Network:
         g_xyz = tf.transpose(g_xyz, perm=(0,2,3,1,4)) # b,n,k,g,d
         g_xyz = tf.reshape(g_xyz, [self.b, n, self.k, -1]) # b,n,k,g*d
 
+        # Because Tensorflow1 does not provide grouped convolution, we employ manual implementation of ShuffleNet.
         g_xyz = helper_tf_util.grouped_conv2d(name + 'global_pe', 
                                      x=g_xyz, 
                                      w=None, 
@@ -443,9 +436,10 @@ class Network:
         g_xyz = tf.reshape(g_xyz, [self.b, n, self.k, self.g, nld_out//self.g]) #b,n,k,g,d_out//2*g
         globalvalue = tf.concat([globalvalue, g_xyz], axis=-1) # b,n,k,g,c//g+d_out//2*g 
         
-        # Gating
+        # counterparts to att_pooling in original RandLANet
         globalvalue, attention_centrality = self.gt_pooling(globalvalue, nld_out, name + 'gt_pooling_2', is_training, neigh_idx, depth) 
         
+        # Gating
         globalvalue = globalvalue * tf.math.tanh(tf.expand_dims(tf.transpose(attention_centrality, [0,2,1]), axis=-1)) #bngc, bng1
         
         # Cat Two
@@ -461,6 +455,7 @@ class Network:
     def relative_pos_encoding(self, xyz, neighbor_xyz):
         # xyz : pyt = b,g,n,3  & tf = b,g,n,3 
         # f_xyz : pyt = b,g,3,n,k & tf = b,g,n,k,3     
+        
         xyz_tile = tf.tile(tf.expand_dims(xyz, axis=3), [1,1,1,self.k,1]) # bgn3 -> bgnk3
         relative_xyz = xyz_tile - neighbor_xyz
         relative_dis = tf.sqrt(tf.reduce_sum(tf.square(relative_xyz), axis=-1, keepdims=True))
@@ -522,6 +517,7 @@ class Network:
         # output;
         #   f_agg: b,n,g,d
         #   attention_centrality: b,g,n
+        
         _,_,_,_,d = feature_set.get_shape()
         n = self.n // (4**depth)
 
@@ -557,40 +553,36 @@ class Network:
         return f_agg, attention_centrality
     
     def attention_centrality(self, attention, neigh_idx, name, depth):
-        
-        # variable version, tf 1.11.0
-        #centrality = tf.Variable(tf.zeros([self.b, self.g, self.n], tf.int32))
-        
-        # tensor version, tf 1.15.0
-        # centrality = tf.zeros([self.b, self.g, self.n], tf.int32)
-        
-        #n = self.n // (4**int(name[14]))
+       
+        # For attention centrality implementation,
+        # Upgrade of tensorflow version 1.11.0 (official RandLANet version) to 1.15.0 is required.
+
         n = self.n // (4**depth)
 
         centrality = tf.zeros([self.b, self.g, n], tf.float32, name=name+"centrality")
-        #print("central bef", centrality.shape)
-        
-        #print("att bef", attention.shape)
-        #print("idx bef", neigh_idx.shape)
-        #print("central bef", centrality.shape)
         attention = tf.reshape(attention, [self.b, self.g, n*self.k], name=name+"attention") # b,g,nk
         neigh_idx = tf.reshape(neigh_idx, [self.b, self.g, n*self.k], name=name+"neigh_idx") # b,g,nk       
-        
-        #neigh_idx = tf.reshape(neigh_idx, [self.b, self.g, -1], name=name+"neigh_idx") # b,g,nk       
-        #attention = tf.reshape(attention, [self.b, self.g, -1], name=name+"attention") # b,g,nk
-        
-        #print("att aft", attention.shape)
-        #print("idx aft", neigh_idx.shape)
-        #print("central aft", centrality.shape)
-        
-        #print(" == ")
-        
-        #centrality = __tf_scatter_add(attention, idx, centrality)
-        centrality = self._tf_scatter_add_2(centrality, neigh_idx, attention)
+        centrality = self._tf_scatter_add(centrality, neigh_idx, attention)
         return centrality
     
     @staticmethod
     def _tf_scatter_add(tensor, indices, updates):
+        # Another manual implementation of pytorch._scatter_add(dim=2, src=tensor, idx=indeces, out=updaties)
+
+        s, b, d = indices.shape
+
+        i1, i2 = tf.meshgrid(tf.range(s), tf.range(b), indexing='ij')
+        i1 = tf.tile(i1[:, :, tf.newaxis], [1,1,d])
+        i2 = tf.tile(i2[:, :, tf.newaxis], [1,1,d])
+
+        idx = tf.stack([i1, i2, indices], axis=-1)
+        scatter = tf.tensor_scatter_nd_add(tensor, idx, updates)
+
+        return scatter
+
+    
+    @staticmethod
+    def _tf_scatter_add_legacy(tensor, indices, updates):
         # manual implementation of pytorch._scatter_add(dim=2, src=tensor, idx=indeces, out=updaties)
 
         original_tensor = tensor
@@ -614,24 +606,6 @@ class Network:
         scatter = tf.tensor_scatter_nd_add(tensor, indices, updates)
         scatter = tf.reshape(scatter, shape=[tf.shape(original_tensor)[0], tf.shape(original_tensor)[1], -1])
         return scatter
-
-   
-    @staticmethod
-    def _tf_scatter_add_2(tensor, indices, updates):
-        # Another manual implementation of pytorch._scatter_add(dim=2, src=tensor, idx=indeces, out=updaties)
-
-        s, b, d = indices.shape
-
-        i1, i2 = tf.meshgrid(tf.range(s), tf.range(b), indexing='ij')
-        i1 = tf.tile(i1[:, :, tf.newaxis], [1,1,d])
-        i2 = tf.tile(i2[:, :, tf.newaxis], [1,1,d])
-
-        idx = tf.stack([i1, i2, indices], axis=-1)
-        scatter = tf.tensor_scatter_nd_add(tensor, idx, updates)
-
-        return scatter
-
-
 
     @staticmethod
     def random_sample(feature, pool_idx):
