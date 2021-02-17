@@ -46,20 +46,18 @@ class ConfigSemanticKITTI:
 class ConfigS3DIS:
     k_n = 16  # KNN
     num_layers = 5  # Number of layers
-    #num_points = 40960  # Number of input points
-    num_points = 10240  # Number of input points
+    num_points = 40960  # Number of input points
     num_classes = 13  # Number of valid classes
     sub_grid_size = 0.04  # preprocess_parameter
 
     num_neighbors = 16
     num_nonlocal_neighbors = 16  # KNN
-    num_groups = 2
+    num_groups = 4
 
-    #batch_size = 6  # batch_size during training
-    batch_size = 2  # batch_size during training
-    val_batch_size = 2  # batch_size during validation and test
-    train_steps = 500  # Number of steps per epochs
-    val_steps = 100  # Number of validation steps per epoch
+    batch_size = 4  # batch_size during training
+    val_batch_size = 4  # batch_size during validation and test
+    train_steps = 750  # Number of steps per epochs
+    val_steps = 500  # Number of validation steps per epoch
 
     sub_sampling_ratio = [4, 4, 4, 4, 2]  # sampling ratio of random sampling at each layer
     d_out = [16, 64, 128, 256, 512]  # feature dimension

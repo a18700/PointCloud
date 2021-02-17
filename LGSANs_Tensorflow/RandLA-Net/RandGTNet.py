@@ -57,7 +57,7 @@ class Network:
             self.inputs['input_inds'] = flat_inputs[4 * num_layers + 2]
             self.inputs['cloud_inds'] = flat_inputs[4 * num_layers + 3]
 
-            print(self.inputs['neigh_idx'])
+            #print(self.inputs['neigh_idx'])
 
             self.labels = self.inputs['labels']
             self.is_training = tf.placeholder(tf.bool, shape=())
@@ -136,6 +136,7 @@ class Network:
             #ES TODO: check 'self.dilated_res_block' and convert to our implementation, GT_res_blocks.
             #f_encoder_i = self.dilated_res_block(feature, inputs['xyz'][i], inputs['neigh_idx'][i], d_out[i],
             s_encoder_i, f_encoder_i = self.gt_res_block(feature, inputs['xyz'][i], inputs['neigh_idx'][i], d_out[i],'Encoder_layer_' + str(i), is_training, i)
+            #print("{} : {}".format(i, f_encoder_i.shape))
             f_sampled_i = self.random_sample(f_encoder_i, inputs['sub_idx'][i])
             s_sampled_i = self.random_sample(s_encoder_i, inputs['sub_idx'][i])
 
@@ -176,19 +177,13 @@ class Network:
         while self.training_epoch < self.config.max_epoch:
             t_start = time.time()            
             
+            self.b = self.config.batch_size
+
             try:
                 #print("==========================================================")
                 #op1 = self.inputs['neigh_idx']
                 #op2 = self.inputs['xyz']
                 #op3 = self.inputs['sub_idx']
-                #nei1 = self.sess.run(op1)
-                #nei2 = self.sess.run(op2)
-                #nei3 = self.sess.run(op3)
-                #for i in range(self.config.num_layers):
-                #    print("neighidxs {}".format(nei1[i].shape))
-                #    print("sub_idxs {}".format(nei3[i].shape))
-                #    #print("xyzs {}".format(nei2[i].shape))
-                #print("==========================================================")
                 ops = [self.train_op,
                        self.extra_update_ops,
                        self.merged,
@@ -196,6 +191,16 @@ class Network:
                        self.logits,
                        self.labels,
                        self.accuracy]
+                #nei1 = self.sess.run(op1)
+                #nei2 = self.sess.run(op2)
+                #nei3 = self.sess.run(op3)
+                
+                #for i in range(self.config.num_layers):
+                #    print("neighidxs {}".format(nei1[i].shape))
+                #    print("xyzs {}".format(nei2[i].shape))
+                #    print("sub_idxs {}".format(nei3[i].shape))
+                
+                #print("==========================================================")
                 
                 _, _, summary, l_out, probs, labels, acc = self.sess.run(ops, {self.is_training: True})
                 self.train_writer.add_summary(summary, self.training_step)
@@ -249,6 +254,8 @@ class Network:
         true_positive_classes = [0 for _ in range(self.config.num_classes)]
         val_total_correct = 0
         val_total_seen = 0
+
+        self.b = self.config.val_batch_size
 
         for step_id in range(self.config.val_steps):
             if step_id % 50 == 0:
@@ -308,6 +315,9 @@ class Network:
         return output_loss
 
 
+
+
+
     def dilated_res_block(self, feature, xyz, neigh_idx, d_out, name, is_training):
         # feature : pyt = b, c, n, 1 & tf = b, n, 1, c
         f_pc = helper_tf_util.conv2d(feature, d_out // 2, [1, 1], name + 'mlp1', [1, 1], 'VALID', True, is_training)
@@ -323,11 +333,11 @@ class Network:
         # xyz : pyt = b, n, 3  & tf = b, n, 3 
         # feature : pyt = b, c, n, 1 & tf = b, n, 1, c
         # neigh_idx : pyt = b, n, k & tf = b, n, k
-        
         f_pc = helper_tf_util.conv2d(feature, d_out // 2, [1, 1], name + 'mlp1', [1, 1], 'VALID', True, is_training)
         stored_f_pc, f_pc = self.gtmodule(xyz, f_pc, neigh_idx, d_out, name + 'LFA', is_training, depth)
         f_pc = helper_tf_util.conv2d(f_pc, d_out * 2, [1, 1], name + 'mlp2', [1, 1], 'VALID', True, is_training, activation_fn=None)
         stored_f_pc = helper_tf_util.conv2d(stored_f_pc, d_out * 2, [1, 1], name + 'mlp2_for_store', [1, 1], 'VALID', True, is_training, activation_fn=None)
+        #stored_value = helper_tf_util.conv2d(localvalue, d_out, [1, 1], name + 'conv_for_store', [1, 1], 'VALID', True, is_training)
 
         shortcut = helper_tf_util.conv2d(feature, d_out * 2, [1, 1], name + 'shortcut', [1, 1], 'VALID', activation_fn=None, bn=True, is_training=is_training)
           
@@ -355,33 +365,82 @@ class Network:
         # xyz : pyt = b, n, 3  & tf = b, n, 3 
         # feature : pyt = b, c, n, 1 & tf = b, n, 1, c
         # neigh_idx : pyt = b, n, k & tf = b, n, k
-        
         _,_,_,d_in = feature.get_shape()
         ld_out = int(d_out * 0.75)
         nld_out = int(d_out * 0.25)
         n = self.n // (4**depth)
         
+        print("depth : {}".format(depth))
+        print("xyz", xyz.shape)
+        print("fea", feature.shape)
+        print("ldout", ld_out)
+        print("nldout", nld_out)
 
         neigh_idx = tf.tile(tf.expand_dims(neigh_idx, axis=1), [1,self.g,1,1]) # b,1,n,k -> b,g,n,k
         xyz = tf.tile(tf.expand_dims(xyz, axis=1), [1,self.g,1,1]) # b,1,n,3 -> b,g,n,3
 
         # Stage1 : Local Layer
         localvalue = tf.reshape(feature, [-1, n, self.g, d_in//self.g]) # b,n,g,c//g
+        print("lv - res", localvalue.shape)
         localvalue = tf.transpose(localvalue, perm=(0,2,1,3)) # b,g,n,c//g  
+        print("lv - tra", localvalue.shape)
         
         # Pointwisely concat feature and coordinates
         localvalue = tf.concat([localvalue, xyz], axis=-1) # b,g,n,c//g+3  
+        print("lv - cat", localvalue.shape)
 
         # First local operation
         localvalue, f_xyz = self.group_gather_neighbour(localvalue, neigh_idx, None, d_in//self.g) # b,g,n,k,c//g & b,g,n,k,3
+        print("lv - gat", localvalue.shape)
         f_xyz = self.relative_pos_encoding(xyz, f_xyz) # b,g,n,k,10
         localvalue = tf.transpose(localvalue, perm=(0,2,3,1,4)) # b,n,k,g,c//g
+        print("lv - tra", localvalue.shape)
         f_xyz = tf.transpose(f_xyz, perm=(0,2,3,1,4)) # b,n,k,g,10
         f_xyz = tf.reshape(f_xyz, [self.b, n, self.k, -1]) # b,n,k,g*10
-
-        # Because Tensorflow1 does not provide grouped convolution, we employ manual implementation of ShuffleNet.
+        
         f_xyz = helper_tf_util.grouped_conv2d(name + 'local_pe', 
                                      x=f_xyz, 
+                                     w=None, 
+                                     num_filters=d_in, 
+                                     kernel_size=(1, 1),
+                                     padding='VALID',
+                                     num_groups=self.g, 
+                                     #l2_strength=0, 
+                                     l2_strength=4e-5, 
+                                     bias=0.0,
+                                     activation=True,
+                                     batchnorm_enabled=True, 
+                                     is_training=is_training)
+
+        f_xyz = tf.reshape(f_xyz, [self.b, n, self.k, self.g, d_in//self.g]) #b,n,k,g,d_in//g
+        
+        localvalue = tf.concat([localvalue, f_xyz], axis=-1) # b,n,k,g,2*d_in//g 
+        print("lv - cat", localvalue.shape)
+        localvalue, attention_centrality = self.gt_pooling(localvalue, ld_out//self.g, name + 'gt_pooling_1', is_training, neigh_idx, depth) 
+        print("lv - gtp", localvalue.shape)
+
+
+        # Stage2 : Global Layer
+
+        # Global Indexing
+        _, ac_idx = tf.math.top_k(attention_centrality, k=self.knl) # sorted? # bgk
+        ac_idx = tf.tile(tf.expand_dims(ac_idx, axis=2), [1,1,n,1]) # bgk -> bgnk
+        
+        # Pointwisely concat feature and coordinates
+        globalvalue = tf.concat([tf.transpose(localvalue, [0,2,1,3]), xyz], axis=-1) # b,g,n,c//g+3  
+        print("gv - cat", localvalue.shape)
+
+        # First local operation
+        globalvalue, g_xyz = self.group_gather_neighbour(globalvalue, ac_idx, None, ld_out//self.g) # b,g,n,k,c//g & b,g,n,k,3
+        print("gv - gat", localvalue.shape)
+        g_xyz = self.relative_pos_encoding(xyz, g_xyz) # b,g,n,k,d
+        globalvalue = tf.transpose(globalvalue, perm=(0,2,3,1,4)) # b,n,k,g,d
+        print("gv - tra", localvalue.shape)
+        g_xyz = tf.transpose(g_xyz, perm=(0,2,3,1,4)) # b,n,k,g,d
+        g_xyz = tf.reshape(g_xyz, [self.b, n, self.k, -1]) # b,n,k,g*d
+
+        g_xyz = helper_tf_util.grouped_conv2d(name + 'global_pe', 
+                                     x=g_xyz, 
                                      w=None, 
                                      num_filters=ld_out, 
                                      kernel_size=(1, 1),
@@ -393,69 +452,34 @@ class Network:
                                      activation=True,
                                      batchnorm_enabled=True, 
                                      is_training=is_training)
-
-        f_xyz = tf.reshape(f_xyz, [self.b, n, self.k, self.g, ld_out//self.g]) #b,n,k,g,d_out//2*g
-        
-        localvalue = tf.concat([localvalue, f_xyz], axis=-1) # b,n,k,g,c//g+d_out//2*g 
-        
-        # counterparts to att_pooling in original RandLANet
-        localvalue, attention_centrality = self.gt_pooling(localvalue, ld_out, name + 'gt_pooling_1', is_training, neigh_idx, depth) 
-
-
-        # Stage2 : Global Layer
-
-        # Global Indexing
-        _, ac_idx = tf.math.top_k(attention_centrality, k=self.knl) # sorted? # bgk
-        ac_idx = tf.tile(tf.expand_dims(ac_idx, axis=2), [1,1,n,1]) # bgk -> bgnk
-        
-        # Pointwisely concat feature and coordinates
-        globalvalue = tf.concat([tf.transpose(localvalue, [0,2,1,3]), xyz], axis=-1) # b,g,n,c//g+3  
-
-        # First local operation
-
-        globalvalue, g_xyz = self.group_gather_neighbour(globalvalue, ac_idx, None, ld_out//self.g) # b,g,n,k,c//g & b,g,n,k,3
-        g_xyz = self.relative_pos_encoding(xyz, g_xyz) # b,g,n,k,d
-        globalvalue = tf.transpose(globalvalue, perm=(0,2,3,1,4)) # b,n,k,g,d
-        g_xyz = tf.transpose(g_xyz, perm=(0,2,3,1,4)) # b,n,k,g,d
-        g_xyz = tf.reshape(g_xyz, [self.b, n, self.k, -1]) # b,n,k,g*d
-
-        # Because Tensorflow1 does not provide grouped convolution, we employ manual implementation of ShuffleNet.
-        g_xyz = helper_tf_util.grouped_conv2d(name + 'global_pe', 
-                                     x=g_xyz, 
-                                     w=None, 
-                                     num_filters=nld_out, 
-                                     kernel_size=(1, 1),
-                                     padding='VALID',
-                                     num_groups=self.g, 
-                                     #l2_strength=0, 
-                                     l2_strength=4e-5, 
-                                     bias=0.0,
-                                     activation=True,
-                                     batchnorm_enabled=True, 
-                                     is_training=is_training)
-        g_xyz = tf.reshape(g_xyz, [self.b, n, self.k, self.g, nld_out//self.g]) #b,n,k,g,d_out//2*g
+        g_xyz = tf.reshape(g_xyz, [self.b, n, self.k, self.g, ld_out//self.g]) #b,n,k,g,d_out//2*g
         globalvalue = tf.concat([globalvalue, g_xyz], axis=-1) # b,n,k,g,c//g+d_out//2*g 
-        
-        # counterparts to att_pooling in original RandLANet
-        globalvalue, attention_centrality = self.gt_pooling(globalvalue, nld_out, name + 'gt_pooling_2', is_training, neigh_idx, depth) 
+        print("gv - cat", localvalue.shape)
         
         # Gating
+        globalvalue, attention_centrality = self.gt_pooling(globalvalue, nld_out//self.g, name + 'gt_pooling_2', is_training, neigh_idx, depth) 
+        print("gv - gtp", globalvalue.shape)
+        
         globalvalue = globalvalue * tf.math.tanh(tf.expand_dims(tf.transpose(attention_centrality, [0,2,1]), axis=-1)) #bngc, bng1
+        print("gv - tan", globalvalue.shape)
         
         # Cat Two
         localvalue = tf.reshape(localvalue, [self.b, n, 1, -1])
-        globalvalue = tf.reshape(localvalue, [self.b, n, 1, -1])
+        globalvalue = tf.reshape(globalvalue, [self.b, n, 1, -1])
+        print("lv - res", localvalue.shape)
+        print("gv - res", globalvalue.shape)
 
         conferred_value = tf.concat([localvalue, globalvalue], axis=-1)
+        print("cv", conferred_value.shape)
         conferred_value = tf.layers.batch_normalization(conferred_value, -1, 0.99, 1e-6, training=is_training)
         stored_value = helper_tf_util.conv2d(localvalue, d_out, [1, 1], name + 'conv_for_store', [1, 1], 'VALID', True, is_training)
+        print("sv", stored_value.shape)
         
         return stored_value, conferred_value
 
     def relative_pos_encoding(self, xyz, neighbor_xyz):
         # xyz : pyt = b,g,n,3  & tf = b,g,n,3 
         # f_xyz : pyt = b,g,3,n,k & tf = b,g,n,k,3     
-        
         xyz_tile = tf.tile(tf.expand_dims(xyz, axis=3), [1,1,1,self.k,1]) # bgn3 -> bgnk3
         relative_xyz = xyz_tile - neighbor_xyz
         relative_dis = tf.sqrt(tf.reduce_sum(tf.square(relative_xyz), axis=-1, keepdims=True))
@@ -508,8 +532,6 @@ class Network:
         f_agg = tf.reshape(f_agg, [self.b, self.n, 1, d])
         f_agg = helper_tf_util.conv2d(f_agg, d_out, [1, 1], name + 'mlp', [1, 1], 'VALID', True, is_training)
         return f_agg
-
-
     
     def gt_pooling(self, feature_set, d_out, name, is_training, neigh_idx, depth):
         # input;
@@ -517,13 +539,14 @@ class Network:
         # output;
         #   f_agg: b,n,g,d
         #   attention_centrality: b,g,n
-        
         _,_,_,_,d = feature_set.get_shape()
         n = self.n // (4**depth)
 
         identity = feature_set
+        print("gtp - feature_set bef", feature_set.shape)
         feature_set = tf.reshape(feature_set, [self.b, n, self.k, -1]) # b,n,k,g*10
-        
+        print("gtp - feature_set aft", feature_set.shape)
+
         att_activation = helper_tf_util.grouped_conv2d(name + 'gt_pooling', 
                                      x=feature_set, 
                                      w=None, 
@@ -539,36 +562,40 @@ class Network:
                                      is_training=is_training)
         
         att_activation = tf.reshape(att_activation, [self.b, n, self.k, self.g, d])
+        print("gtp - att act", att_activation.shape)
         att_scores = tf.nn.softmax(att_activation, axis=2) # b,n,k,g,d//g
+        print("gtp - att score", att_activation.shape)
 
         f_agg = identity * att_scores # b,n,k,g,d//g
+        print("gtp - fagg", f_agg.shape)
         f_agg = tf.reduce_sum(f_agg, axis=2) # b,n,g,d//g
+        print("gtp - red sum", f_agg.shape)
         f_agg = helper_tf_util.conv2d(f_agg, d_out, [1, 1], name + 'mlp', [1, 1], 'VALID', True, is_training)
+        print("gtp - conv", f_agg.shape)
         
         # attention centrality
         att_scores = tf.reduce_sum(att_scores, axis=-1) # b,n,k,g
         att_scores = tf.transpose(att_scores, [0,3,1,2]) # b,g,n,k
         attention_centrality = self.attention_centrality(att_scores, neigh_idx, name, depth)
 
+        print("gtp - after ac", f_agg.shape)
         return f_agg, attention_centrality
     
     def attention_centrality(self, attention, neigh_idx, name, depth):
-       
-        # For attention centrality implementation,
-        # Upgrade of tensorflow version 1.11.0 (official RandLANet version) to 1.15.0 is required.
-
+        
         n = self.n // (4**depth)
 
         centrality = tf.zeros([self.b, self.g, n], tf.float32, name=name+"centrality")
         attention = tf.reshape(attention, [self.b, self.g, n*self.k], name=name+"attention") # b,g,nk
         neigh_idx = tf.reshape(neigh_idx, [self.b, self.g, n*self.k], name=name+"neigh_idx") # b,g,nk       
+        
         centrality = self._tf_scatter_add(centrality, neigh_idx, attention)
         return centrality
     
+   
     @staticmethod
     def _tf_scatter_add(tensor, indices, updates):
         # Another manual implementation of pytorch._scatter_add(dim=2, src=tensor, idx=indeces, out=updaties)
-
         s, b, d = indices.shape
 
         i1, i2 = tf.meshgrid(tf.range(s), tf.range(b), indexing='ij')
@@ -580,32 +607,7 @@ class Network:
 
         return scatter
 
-    
-    @staticmethod
-    def _tf_scatter_add_legacy(tensor, indices, updates):
-        # manual implementation of pytorch._scatter_add(dim=2, src=tensor, idx=indeces, out=updaties)
 
-        original_tensor = tensor
-        # expand index value from vocab size
-        indices = tf.reshape(indices, shape=[-1, tf.shape(indices)[-1]])
-        indices_add = tf.expand_dims(tf.range(0, tf.shape(indices)[0], 1)*(tf.shape(tensor)[-1]), axis=-1)
-        indices += indices_add
-
-        # resize
-        tensor = tf.reshape(tensor, shape=[-1])
-        indices = tf.reshape(indices, shape=[-1, 1])
-        updates = tf.reshape(updates, shape=[-1])
-
-        # check_
-        """
-        update = tensor.shape[indices.shape[-1]:]
-        res = indices.shape[:-1] + update
-        """
-        #same Torch scatter_add_
-        #scatter = tf.scatter_nd_add(tensor, indices, updates)
-        scatter = tf.tensor_scatter_nd_add(tensor, indices, updates)
-        scatter = tf.reshape(scatter, shape=[tf.shape(original_tensor)[0], tf.shape(original_tensor)[1], -1])
-        return scatter
 
     @staticmethod
     def random_sample(feature, pool_idx):
